@@ -38,8 +38,14 @@ var ErrMismatchFields = errors.New("arrow/avro: number of records mismatch")
 // Option configures an Avro reader/writer.
 type (
 	Option func(config)
-	config *OCFReader
+	config *reader
 )
+
+// A decoder is an interface that wraps the Decode and HasNext methods.
+type decoder interface {
+	Decode(any) error
+	HasNext() bool
+}
 
 type schemaEdit struct {
 	method string
@@ -47,9 +53,103 @@ type schemaEdit struct {
 	value  any
 }
 
-// Reader wraps goavro/OCFReader and creates array.Records from a schema.
+// wrappedDecoder wraps an avro.Decoder to implement the decoder interface.
+type wrappedDecoder struct {
+	*avro.Decoder
+}
+
+func (w *wrappedDecoder) HasNext() bool {
+	return true
+}
+
+// AvroReader wraps goavro/Decoder and creates array.Records from a schema.
+type AvroReader struct {
+	*reader
+}
+
+// NewAvroReader returns a reader that reads avro records and creates
+// arrow.Records from the converted avro data.
+// CHUNK SIZE MUST BE LARGER THAN ONE -- TODO: ASSERT THIS IS THE CASE!! REDESIGN ME
+func NewAvroReader(schema string, r io.Reader, opts ...Option) (*AvroReader, error) {
+	d, err := avro.NewDecoder(schema, r)
+
+	if err != nil {
+		return nil, fmt.Errorf("%w: could not create avro decoder", arrow.ErrInvalid)
+	}
+
+	rr, err := newReader(schema, &wrappedDecoder{d}, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &AvroReader{
+		reader: rr,
+	}, nil
+}
+
+// OCFReader wraps goavro/OCFReader and creates array.Records from a schema.
 type OCFReader struct {
-	r               *ocf.Decoder
+	*reader
+}
+
+// NewOCFReader returns a reader that reads from an Avro OCF file and creates
+// arrow.Records from the converted avro data.
+func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
+	d, err := ocf.NewDecoder(r)
+	if err != nil {
+		return nil, fmt.Errorf("%w: could not create avro ocf decoder", arrow.ErrInvalid)
+	}
+
+	schema := string(d.Metadata()["avro.schema"])
+	rr, err := newReader(schema, d, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &OCFReader{
+		reader: rr,
+	}, nil
+}
+
+// Reuse allows the OCFReader to be reused to read another Avro file provided the
+// new Avro file has an identical schema.
+func (rr *OCFReader) Reuse(r io.Reader, opts ...Option) error {
+	rr.Close()
+	rr.err = nil
+	ocfr, err := ocf.NewDecoder(r)
+	if err != nil {
+		return fmt.Errorf("%w: could not create avro ocfreader", arrow.ErrInvalid)
+	}
+	schema, err := avro.Parse(string(ocfr.Metadata()["avro.schema"]))
+	if err != nil {
+		return fmt.Errorf("%w: could not parse avro header", arrow.ErrInvalid)
+	}
+	if rr.avroSchema != schema.String() {
+		return fmt.Errorf("%w: avro schema mismatch", arrow.ErrInvalid)
+	}
+
+	rr.decoder = ocfr
+	for _, opt := range opts {
+		opt(rr.reader)
+	}
+
+	rr.maxOCF = 0
+	rr.maxRec = 0
+	rr.avroDatumCount = 0
+	rr.primed = false
+
+	rr.avroChan = make(chan any, rr.avroChanSize)
+	rr.recChan = make(chan arrow.Record, rr.recChanSize)
+	rr.bldDone = make(chan struct{})
+
+	rr.readerCtx, rr.readCancel = context.WithCancel(context.Background())
+	go rr.decodeOCFToChan()
+	go rr.recordFactory()
+	return nil
+}
+
+type reader struct {
+	decoder         decoder
 	avroSchema      string
 	avroSchemaEdits []schemaEdit
 	schema          *arrow.Schema
@@ -79,16 +179,9 @@ type OCFReader struct {
 	mem         memory.Allocator
 }
 
-// NewReader returns a reader that reads from an Avro OCF file and creates
-// arrow.Records from the converted avro data.
-func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
-	ocfr, err := ocf.NewDecoder(r)
-	if err != nil {
-		return nil, fmt.Errorf("%w: could not create avro ocfreader", arrow.ErrInvalid)
-	}
-
-	rr := &OCFReader{
-		r:            ocfr,
+func newReader(schema string, d decoder, opts ...Option) (*reader, error) {
+	rr := &reader{
+		decoder:      d,
 		refs:         1,
 		chunk:        1,
 		avroChanSize: 500,
@@ -101,11 +194,11 @@ func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
 	rr.avroChan = make(chan any, rr.avroChanSize)
 	rr.recChan = make(chan arrow.Record, rr.recChanSize)
 	rr.bldDone = make(chan struct{})
-	schema, err := avro.Parse(string(ocfr.Metadata()["avro.schema"]))
+	s, err := avro.Parse(schema)
 	if err != nil {
-		return nil, fmt.Errorf("%w: could not parse avro header", arrow.ErrInvalid)
+		return nil, fmt.Errorf("%w: could not parse avro schema", arrow.ErrInvalid)
 	}
-	rr.avroSchema = schema.String()
+	rr.avroSchema = s.String()
 	if len(rr.avroSchemaEdits) > 0 {
 		// execute schema edits
 		for _, e := range rr.avroSchemaEdits {
@@ -115,12 +208,12 @@ func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
 			}
 		}
 		// validate edited schema
-		schema, err = avro.Parse(rr.avroSchema)
+		s, err = avro.Parse(rr.avroSchema)
 		if err != nil {
 			return nil, fmt.Errorf("%w: could not parse modified avro schema", arrow.ErrInvalid)
 		}
 	}
-	rr.schema, err = ArrowSchemaFromAvro(schema)
+	rr.schema, err = ArrowSchemaFromAvro(s)
 	if err != nil {
 		return nil, fmt.Errorf("%w: could not convert avro schema", arrow.ErrInvalid)
 	}
@@ -141,75 +234,38 @@ func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
 	return rr, nil
 }
 
-// Reuse allows the OCFReader to be reused to read another Avro file provided the
-// new Avro file has an identical schema.
-func (rr *OCFReader) Reuse(r io.Reader, opts ...Option) error {
-	rr.Close()
-	rr.err = nil
-	ocfr, err := ocf.NewDecoder(r)
-	if err != nil {
-		return fmt.Errorf("%w: could not create avro ocfreader", arrow.ErrInvalid)
-	}
-	schema, err := avro.Parse(string(ocfr.Metadata()["avro.schema"]))
-	if err != nil {
-		return fmt.Errorf("%w: could not parse avro header", arrow.ErrInvalid)
-	}
-	if rr.avroSchema != schema.String() {
-		return fmt.Errorf("%w: avro schema mismatch", arrow.ErrInvalid)
-	}
-
-	rr.r = ocfr
-	for _, opt := range opts {
-		opt(rr)
-	}
-
-	rr.maxOCF = 0
-	rr.maxRec = 0
-	rr.avroDatumCount = 0
-	rr.primed = false
-
-	rr.avroChan = make(chan any, rr.avroChanSize)
-	rr.recChan = make(chan arrow.Record, rr.recChanSize)
-	rr.bldDone = make(chan struct{})
-
-	rr.readerCtx, rr.readCancel = context.WithCancel(context.Background())
-	go rr.decodeOCFToChan()
-	go rr.recordFactory()
-	return nil
-}
-
 // Err returns the last error encountered during the iteration over the
 // underlying Avro file.
-func (r *OCFReader) Err() error { return r.err }
+func (r *reader) Err() error { return r.err }
 
 // AvroSchema returns the Avro schema of the Avro OCF
-func (r *OCFReader) AvroSchema() string { return r.avroSchema }
+func (r *reader) AvroSchema() string { return r.avroSchema }
 
 // Schema returns the converted Arrow schema of the Avro OCF
-func (r *OCFReader) Schema() *arrow.Schema { return r.schema }
+func (r *reader) Schema() *arrow.Schema { return r.schema }
 
 // Record returns the current record that has been extracted from the
 // underlying Avro OCF file.
 // It is valid until the next call to Next.
-func (r *OCFReader) Record() arrow.Record { return r.cur }
+func (r *reader) Record() arrow.Record { return r.cur }
 
 // Metrics returns the maximum queue depth of the Avro record read cache and of the
 // converted Arrow record cache.
-func (r *OCFReader) Metrics() string {
+func (r *reader) Metrics() string {
 	return fmt.Sprintf("Max. OCF queue depth: %d/%d  Max. record queue depth: %d/%d", r.maxOCF, r.avroChanSize, r.maxRec, r.recChanSize)
 }
 
-// OCFRecordsReadCount returns the number of Avro datum that were read from the Avro file.
-func (r *OCFReader) OCFRecordsReadCount() int64 { return r.avroDatumCount }
+// RecordsReadCount returns the number of Avro datum that were read from the Avro file.
+func (r *reader) RecordsReadCount() int64 { return r.avroDatumCount }
 
-// Close closes the OCFReader's Avro record read cache and converted Arrow record cache. OCFReader must
-// be closed if the Avro OCF's records have not been read to completion.
-func (r *OCFReader) Close() {
+// Close closes the reader's Avro record read cache and converted Arrow record cache. The reader must
+// be closed if the Avro records have not been read to completion.
+func (r *reader) Close() {
 	r.readCancel()
 	r.err = r.readerCtx.Err()
 }
 
-func (r *OCFReader) editAvroSchema(e schemaEdit) error {
+func (r *reader) editAvroSchema(e schemaEdit) error {
 	var err error
 	switch e.method {
 	case "set":
@@ -231,7 +287,7 @@ func (r *OCFReader) editAvroSchema(e schemaEdit) error {
 // Next returns whether a Record can be received from the converted record queue.
 // The user should check Err() after call to Next that return false to check
 // if an error took place.
-func (r *OCFReader) Next() bool {
+func (r *reader) Next() bool {
 	if r.cur != nil {
 		r.cur.Release()
 		r.cur = nil
@@ -317,14 +373,14 @@ func WithChunk(n int) Option {
 
 // Retain increases the reference count by 1.
 // Retain may be called simultaneously from multiple goroutines.
-func (r *OCFReader) Retain() {
+func (r *reader) Retain() {
 	atomic.AddInt64(&r.refs, 1)
 }
 
 // Release decreases the reference count by 1.
 // When the reference count goes to zero, the memory is freed.
 // Release may be called simultaneously from multiple goroutines.
-func (r *OCFReader) Release() {
+func (r *reader) Release() {
 	debug.Assert(atomic.LoadInt64(&r.refs) > 0, "too many releases")
 
 	if atomic.AddInt64(&r.refs, -1) == 0 {
