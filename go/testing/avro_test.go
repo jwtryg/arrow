@@ -2,6 +2,7 @@ package testing
 
 import (
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/hamba/avro/v2"
@@ -32,7 +33,11 @@ func NewUserBuffer(bufsize int) *UserBuffer {
 }
 
 func (r *UserBuffer) Read(buf []byte) (int, error) {
-	user := <-r.ch
+	user, ok := <-r.ch
+	if !ok {
+		return 0, io.EOF
+	}
+
 	userJson, err := avro.Marshal(UserSchema, user)
 	if err != nil {
 		return 0, err
