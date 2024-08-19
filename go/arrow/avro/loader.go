@@ -20,9 +20,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 )
 
-func (r *reader) decodeOCFToChan() {
+func (r *baseReader) decodeAvroToChan() {
 	defer close(r.avroChan)
 	for r.decoder.HasNext() {
 		select {
@@ -46,7 +47,7 @@ func (r *reader) decodeOCFToChan() {
 	}
 }
 
-func (r *reader) recordFactory() {
+func (r *OCFReader) recordFactory() {
 	defer close(r.recChan)
 	r.primed = true
 	recChunk := 0
@@ -81,5 +82,54 @@ func (r *reader) recordFactory() {
 			r.recChan <- r.bld.NewRecord()
 		}
 		r.bldDone <- struct{}{}
+	}
+}
+
+func (r *StreamReader) recordFactory(flush_timeout time.Duration) {
+	defer close(r.recChan)
+	lastRead := time.Now()
+	r.primed = true
+	recChunk := 0
+
+	if r.chunk < 1 {
+		r.err = fmt.Errorf("chunk size must be greater than 0")
+		return
+	}
+
+	for {
+		select {
+		case data, ok := <-r.avroChan:
+			if !ok {
+				if recChunk != 0 {
+					r.recChan <- r.bld.NewRecord()
+				}
+				r.err = fmt.Errorf("avro channel closed")
+				return
+			}
+			if recChunk == 0 {
+				r.bld.Reserve(r.chunk)
+			}
+			err := r.ldr.loadDatum(data)
+			if err != nil {
+				r.err = err
+				return
+			}
+			recChunk++
+			if recChunk >= r.chunk {
+				r.recChan <- r.bld.NewRecord()
+				recChunk = 0
+			}
+
+		case <-r.readerCtx.Done():
+			r.err = fmt.Errorf("context cancelled")
+			return
+
+		default:
+			if flush_timeout > 0 && time.Since(lastRead) > flush_timeout {
+				r.recChan <- r.bld.NewRecord()
+				lastRead = time.Now()
+				recChunk = 0
+			}
+		}
 	}
 }

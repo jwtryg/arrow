@@ -343,7 +343,7 @@ func TestEditSchemaStringEqual(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%v", err)
 			}
-			r := new(OCFReader)
+			r := new(baseReader)
 			r.avroSchema = schema.String()
 			r.editAvroSchema(schemaEdit{method: "delete", path: "fields.0"})
 			schema, err = hamba.Parse(r.avroSchema)

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
@@ -38,7 +39,7 @@ var ErrMismatchFields = errors.New("arrow/avro: number of records mismatch")
 // Option configures an Avro reader/writer.
 type (
 	Option func(config)
-	config *reader
+	config *baseReader
 )
 
 // A decoder is an interface that wraps the Decode and HasNext methods.
@@ -53,43 +54,9 @@ type schemaEdit struct {
 	value  any
 }
 
-// wrappedDecoder wraps an avro.Decoder to implement the decoder interface.
-type wrappedDecoder struct {
-	*avro.Decoder
-}
-
-func (w *wrappedDecoder) HasNext() bool {
-	return true
-}
-
-// AvroReader wraps goavro/Decoder and creates array.Records from a schema.
-type AvroReader struct {
-	*reader
-}
-
-// NewAvroReader returns a reader that reads avro records and creates
-// arrow.Records from the converted avro data.
-// CHUNK SIZE MUST BE LARGER THAN ONE -- TODO: ASSERT THIS IS THE CASE!! REDESIGN ME
-func NewAvroReader(schema string, r io.Reader, opts ...Option) (*AvroReader, error) {
-	d, err := avro.NewDecoder(schema, r)
-
-	if err != nil {
-		return nil, fmt.Errorf("%w: could not create avro decoder", arrow.ErrInvalid)
-	}
-
-	rr, err := newReader(schema, &wrappedDecoder{d}, opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	return &AvroReader{
-		reader: rr,
-	}, nil
-}
-
 // OCFReader wraps goavro/OCFReader and creates array.Records from a schema.
 type OCFReader struct {
-	*reader
+	*baseReader
 }
 
 // NewOCFReader returns a reader that reads from an Avro OCF file and creates
@@ -101,14 +68,17 @@ func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
 	}
 
 	schema := string(d.Metadata()["avro.schema"])
-	rr, err := newReader(schema, d, opts...)
+	rr, err := newBaseReader(schema, d, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	return &OCFReader{
-		reader: rr,
-	}, nil
+	reader := &OCFReader{
+		baseReader: rr,
+	}
+
+	go reader.recordFactory()
+	return reader, nil
 }
 
 // Reuse allows the OCFReader to be reused to read another Avro file provided the
@@ -130,11 +100,9 @@ func (rr *OCFReader) Reuse(r io.Reader, opts ...Option) error {
 
 	rr.decoder = ocfr
 	for _, opt := range opts {
-		opt(rr.reader)
+		opt(rr.baseReader)
 	}
 
-	rr.maxOCF = 0
-	rr.maxRec = 0
 	rr.avroDatumCount = 0
 	rr.primed = false
 
@@ -143,12 +111,48 @@ func (rr *OCFReader) Reuse(r io.Reader, opts ...Option) error {
 	rr.bldDone = make(chan struct{})
 
 	rr.readerCtx, rr.readCancel = context.WithCancel(context.Background())
-	go rr.decodeOCFToChan()
+	go rr.decodeAvroToChan()
 	go rr.recordFactory()
 	return nil
 }
 
-type reader struct {
+// StreamReader wraps goavro/Decoder and creates array.Records from a schema.
+type StreamReader struct {
+	*baseReader
+}
+
+// streamDecoder wraps an avro.Decoder to implement the decoder interface.
+type streamDecoder struct {
+	*avro.Decoder
+}
+
+func (w *streamDecoder) HasNext() bool {
+	return true
+}
+
+// NewStreamReader returns a reader that reads avro records and creates
+// arrow.Records from the converted avro data.
+// CHUNK SIZE MUST BE LARGER THAN ONE -- TODO: ASSERT THIS IS THE CASE!! REDESIGN ME
+func NewStreamReader(schema string, r io.Reader, flushInterval time.Duration, opts ...Option) (*StreamReader, error) {
+	d, err := avro.NewDecoder(schema, r)
+	if err != nil {
+		return nil, fmt.Errorf("%w: could not create avro decoder", arrow.ErrInvalid)
+	}
+
+	rr, err := newBaseReader(schema, &streamDecoder{d}, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	reader := &StreamReader{
+		baseReader: rr,
+	}
+
+	go reader.recordFactory(flushInterval)
+	return reader, nil
+}
+
+type baseReader struct {
 	decoder         decoder
 	avroSchema      string
 	avroSchemaEdits []schemaEdit
@@ -164,8 +168,6 @@ type reader struct {
 	primed     bool
 	readerCtx  context.Context
 	readCancel func()
-	maxOCF     int
-	maxRec     int
 
 	avroChan       chan any
 	avroDatumCount int64
@@ -179,8 +181,8 @@ type reader struct {
 	mem         memory.Allocator
 }
 
-func newReader(schema string, d decoder, opts ...Option) (*reader, error) {
-	rr := &reader{
+func newBaseReader(schema string, d decoder, opts ...Option) (*baseReader, error) {
+	rr := &baseReader{
 		decoder:      d,
 		refs:         1,
 		chunk:        1,
@@ -221,7 +223,7 @@ func newReader(schema string, d decoder, opts ...Option) (*reader, error) {
 		rr.mem = memory.DefaultAllocator
 	}
 	rr.readerCtx, rr.readCancel = context.WithCancel(context.Background())
-	go rr.decodeOCFToChan()
+	go rr.decodeAvroToChan()
 
 	rr.bld = array.NewRecordBuilder(rr.mem, rr.schema)
 	rr.bldMap = newFieldPos()
@@ -230,42 +232,41 @@ func newReader(schema string, d decoder, opts ...Option) (*reader, error) {
 		mapFieldBuilders(fb, rr.schema.Field(idx), rr.bldMap)
 	}
 	rr.ldr.drawTree(rr.bldMap)
-	go rr.recordFactory()
 	return rr, nil
 }
 
 // Err returns the last error encountered during the iteration over the
 // underlying Avro file.
-func (r *reader) Err() error { return r.err }
+func (r *baseReader) Err() error { return r.err }
 
 // AvroSchema returns the Avro schema of the Avro OCF
-func (r *reader) AvroSchema() string { return r.avroSchema }
+func (r *baseReader) AvroSchema() string { return r.avroSchema }
 
 // Schema returns the converted Arrow schema of the Avro OCF
-func (r *reader) Schema() *arrow.Schema { return r.schema }
+func (r *baseReader) Schema() *arrow.Schema { return r.schema }
 
 // Record returns the current record that has been extracted from the
 // underlying Avro OCF file.
 // It is valid until the next call to Next.
-func (r *reader) Record() arrow.Record { return r.cur }
+func (r *baseReader) Record() arrow.Record { return r.cur }
 
 // Metrics returns the maximum queue depth of the Avro record read cache and of the
 // converted Arrow record cache.
-func (r *reader) Metrics() string {
-	return fmt.Sprintf("Max. OCF queue depth: %d/%d  Max. record queue depth: %d/%d", r.maxOCF, r.avroChanSize, r.maxRec, r.recChanSize)
+func (r *baseReader) Metrics() string {
+	return fmt.Sprintf("Max. avro record queue depth: %d  Max. arrow record queue depth: %d", r.avroChanSize, r.recChanSize)
 }
 
 // RecordsReadCount returns the number of Avro datum that were read from the Avro file.
-func (r *reader) RecordsReadCount() int64 { return r.avroDatumCount }
+func (r *baseReader) RecordsReadCount() int64 { return r.avroDatumCount }
 
 // Close closes the reader's Avro record read cache and converted Arrow record cache. The reader must
 // be closed if the Avro records have not been read to completion.
-func (r *reader) Close() {
+func (r *baseReader) Close() {
 	r.readCancel()
 	r.err = r.readerCtx.Err()
 }
 
-func (r *reader) editAvroSchema(e schemaEdit) error {
+func (r *baseReader) editAvroSchema(e schemaEdit) error {
 	var err error
 	switch e.method {
 	case "set":
@@ -287,16 +288,10 @@ func (r *reader) editAvroSchema(e schemaEdit) error {
 // Next returns whether a Record can be received from the converted record queue.
 // The user should check Err() after call to Next that return false to check
 // if an error took place.
-func (r *reader) Next() bool {
+func (r *baseReader) Next() bool {
 	if r.cur != nil {
 		r.cur.Release()
 		r.cur = nil
-	}
-	if r.maxOCF < len(r.avroChan) {
-		r.maxOCF = len(r.avroChan)
-	}
-	if r.maxRec < len(r.recChan) {
-		r.maxRec = len(r.recChan)
 	}
 	select {
 	case r.cur = <-r.recChan:
@@ -373,14 +368,14 @@ func WithChunk(n int) Option {
 
 // Retain increases the reference count by 1.
 // Retain may be called simultaneously from multiple goroutines.
-func (r *reader) Retain() {
+func (r *baseReader) Retain() {
 	atomic.AddInt64(&r.refs, 1)
 }
 
 // Release decreases the reference count by 1.
 // When the reference count goes to zero, the memory is freed.
 // Release may be called simultaneously from multiple goroutines.
-func (r *reader) Release() {
+func (r *baseReader) Release() {
 	debug.Assert(atomic.LoadInt64(&r.refs) > 0, "too many releases")
 
 	if atomic.AddInt64(&r.refs, -1) == 0 {
@@ -390,4 +385,4 @@ func (r *reader) Release() {
 	}
 }
 
-var _ array.RecordReader = (*OCFReader)(nil)
+var _ array.RecordReader = (*baseReader)(nil)
